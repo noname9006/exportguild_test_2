@@ -18,76 +18,59 @@ let addRoleStmt = null;
  */
 async function processLeftMembers(guild, batchSize = 100, skipRoles = true) {
     console.log(`[${getFormattedDateTime()}] Processing left members for guild ${guild.name} (${guild.id})`);
-    
     const db = monitor.getDatabase();
     if (!db) {
         console.error("Cannot process left members: Database not initialized");
         return { success: false, error: "Database not initialized" };
     }
-
     try {
         // First ensure all required tables exist
         await ensureTablesExist(db);
-        
         // Prepare statements for reuse
         prepareStatements(db);
-        
         // Add required indexes if they don't exist
         await ensureDatabaseIndexes(db);
-        
         // Get all message authors not in guild_members
         const startTime = Date.now();
         const missingMembers = await findMissingMembers(db);
         console.log(`[${getFormattedDateTime()}] Found ${missingMembers.length} users in messages who might have left the guild (query took ${Date.now() - startTime}ms)`);
-
         // Process in larger batches
         let addedCount = 0;
         let processedCount = 0;
         let errorCount = 0;
         const currentTime = Date.now();
-        
         // Process in chunks of batchSize
         for (let i = 0; i < missingMembers.length; i += batchSize) {
             const batchStartTime = Date.now();
             const memberBatch = missingMembers.slice(i, i + batchSize);
             const memberIds = memberBatch.map(m => m.authorId);
-            
             console.log(`[${getFormattedDateTime()}] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(missingMembers.length / batchSize)} (${memberBatch.length} members)`);
-            
             try {
                 // Begin transaction
                 await beginTransaction(db);
-                
                 // Preload all timestamp data in a single query
                 const timestampsMap = await preloadMemberTimestamps(db, memberIds);
-                
                 // Prepare members for bulk insert
                 const membersToAdd = [];
-                
                 for (const member of memberBatch) {
                     const timestamps = timestampsMap[member.authorId];
                     if (!timestamps) continue;
-                    
                     const memberInfo = {
                         id: member.authorId,
                         username: member.authorUsername,
                         joinedTimestamp: timestamps.firstMessageTime,
                         leftTimestamp: timestamps.lastMessageTime
                     };
-                    
                     membersToAdd.push(memberInfo);
                 }
-                
                 // Bulk add members
                 const result = await addLeftMembersToBulk(db, membersToAdd, currentTime);
                 addedCount += result;
                 processedCount += memberBatch.length;
-                
                 // Commit transaction
                 await commitTransaction(db);
-                
                 const batchTime = Date.now() - batchStartTime;
-                console.log(`[${getFormattedDateTime()}] Batch completed in ${batchTime}ms: ${result}/${memberBatch.length} members added successfully (${(batchTime / memberBatch.length).toFixed(2)}ms per member)`);
+                console.log(`[${getFormattedDateTime()}] Batch completed in ${batchTime}ms: ${result}/${memberBatch.length} members added successfully (${(batchTime / memberBatch.length).toFixed(2)}ms/member)`);
             } catch (batchError) {
                 // Rollback on error
                 await rollbackTransaction(db);
@@ -95,9 +78,7 @@ async function processLeftMembers(guild, batchSize = 100, skipRoles = true) {
                 errorCount += memberBatch.length;
             }
         }
-        
         console.log(`[${getFormattedDateTime()}] Added ${addedCount}/${processedCount} left members to database (${errorCount} errors) in ${(Date.now() - startTime)/1000} seconds`);
-        
         return { success: true, addedCount, errorCount };
     } catch (error) {
         console.error(`[${getFormattedDateTime()}] Error processing left members:`, error);
@@ -109,8 +90,7 @@ async function processLeftMembers(guild, batchSize = 100, skipRoles = true) {
 }
 
 /**
- * Check if database tables exist, creating them if needed
- * This ensures all required tables are available before trying to process left members
+ * Ensures required tables exist in the database
  * @param {Object} db - Database connection
  * @returns {Promise<Boolean>} Whether tables were created or already exist
  */
@@ -123,13 +103,11 @@ async function ensureTablesExist(db) {
                 reject(err);
                 return;
             }
-            
             // If all three tables exist, we're good
             if (row && row.tableCount === 3) {
                 resolve(true);
                 return;
             }
-            
             // Import the necessary table creation function from member-tracker
             try {
                 const memberTracker = require('./member-tracker');
@@ -158,12 +136,11 @@ function prepareStatements(db) {
         if (addMemberStmt === null) {
             addMemberStmt = db.prepare(`
                 INSERT OR REPLACE INTO guild_members (
-                    id, username, displayName, avatarURL, joinedAt, joinedTimestamp,
+                    id, username, avatarURL, joinedAt, joinedTimestamp,
                     bot, lastUpdated, leftGuild, leftTimestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
         }
-        
         if (addRoleStmt === null) {
             addRoleStmt = db.prepare(`
                 INSERT OR IGNORE INTO member_roles (
@@ -206,28 +183,24 @@ async function ensureDatabaseIndexes(db) {
                 console.error(`[${getFormattedDateTime()}] Error creating messages index:`, err);
                 // Non-fatal, continue
             }
-            
             // Then add index on leftGuild for faster queries
             db.run(`CREATE INDEX IF NOT EXISTS idx_guild_members_left ON guild_members(leftGuild)`, (err) => {
                 if (err) {
                     console.error(`[${getFormattedDateTime()}] Error creating guild_members index:`, err);
                     // Non-fatal, continue
                 }
-                
                 // Create index on role_history if it doesn't exist
                 db.run(`CREATE INDEX IF NOT EXISTS idx_role_history_member_id ON role_history(memberId)`, (err) => {
                     if (err) {
                         console.error(`[${getFormattedDateTime()}] Error creating role_history index:`, err);
                         // Non-fatal, continue
                     }
-                    
                     // Create index on member_roles if it doesn't exist
                     db.run(`CREATE INDEX IF NOT EXISTS idx_member_roles_member_id ON member_roles(memberId)`, (err) => {
                         if (err) {
                             console.error(`[${getFormattedDateTime()}] Error creating member_roles index:`, err);
                             // Non-fatal, continue
                         }
-                        
                         resolve();
                     });
                 });
@@ -248,7 +221,6 @@ async function preloadMemberTimestamps(db, memberIds) {
             resolve({});
             return;
         }
-        
         const placeholders = memberIds.map(() => '?').join(',');
         const sql = `
             SELECT authorId,
@@ -258,14 +230,12 @@ async function preloadMemberTimestamps(db, memberIds) {
             WHERE authorId IN (${placeholders})
             GROUP BY authorId
         `;
-        
         db.all(sql, memberIds, (err, rows) => {
             if (err) {
                 console.error(`[${getFormattedDateTime()}] Error preloading timestamps:`, err);
                 resolve({});
                 return;
             }
-            
             const result = {};
             rows.forEach(row => {
                 result[row.authorId] = {
@@ -273,7 +243,6 @@ async function preloadMemberTimestamps(db, memberIds) {
                     lastMessageTime: row.lastMessageTime
                 };
             });
-            
             resolve(result);
         });
     });
@@ -292,24 +261,19 @@ function addLeftMembersToBulk(db, members, currentTime) {
             resolve(0);
             return;
         }
-        
         // Create a single SQL statement with multiple VALUES clauses
         let sql = `
             INSERT OR REPLACE INTO guild_members 
-            (id, username, displayName, avatarURL, joinedAt, joinedTimestamp, bot, lastUpdated, leftGuild, leftTimestamp)
+            (id, username, avatarURL, joinedAt, joinedTimestamp, bot, lastUpdated, leftGuild, leftTimestamp)
             VALUES `;
-        
         const values = [];
         const params = [];
-        
         members.forEach(member => {
             const joinedAt = member.joinedTimestamp ? new Date(member.joinedTimestamp).toISOString() : null;
             const leftTimestamp = member.leftTimestamp || currentTime;
-            
-            values.push(`(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+            values.push(`(?, ?, ?, ?, ?, ?, ?, ?, ?)`);
             params.push(
                 member.id,
-                member.username,
                 member.username,
                 null,
                 joinedAt,
@@ -320,16 +284,13 @@ function addLeftMembersToBulk(db, members, currentTime) {
                 leftTimestamp
             );
         });
-        
         sql += values.join(', ');
-        
         db.run(sql, params, function(err) {
             if (err) {
                 console.error(`[${getFormattedDateTime()}] Error bulk adding ${members.length} left members:`, err);
                 reject(err);
                 return;
             }
-            
             // Log added members in batches to reduce console output
             if (members.length > 20) {
                 console.log(`[${getFormattedDateTime()}] Bulk added ${this.changes} left members to database`);
@@ -340,7 +301,6 @@ function addLeftMembersToBulk(db, members, currentTime) {
                     console.log(`[${getFormattedDateTime()}] Added left member ${m.username} (${m.id}) to database (estimated join: ${joinedAt}, left: ${leftAt})`);
                 });
             }
-            
             resolve(this.changes || members.length);
         });
     });
@@ -363,14 +323,12 @@ function findMissingMembers(db) {
             )
             LIMIT 10000
         `;
-
         db.all(sql, [], (err, rows) => {
             if (err) {
                 console.error(`[${getFormattedDateTime()}] Error finding missing members:`, err);
                 reject(err);
                 return;
             }
-            
             resolve(rows);
         });
     });

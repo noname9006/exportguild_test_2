@@ -18,7 +18,6 @@ async function initializeMemberDatabase(db) {
       CREATE TABLE IF NOT EXISTS guild_members (
         id TEXT PRIMARY KEY,
         username TEXT,
-        displayName TEXT,
         avatarURL TEXT,
         joinedAt TEXT,
         joinedTimestamp INTEGER,
@@ -58,7 +57,6 @@ async function initializeMemberDatabase(db) {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             memberId TEXT,
             roleId TEXT,
-            roleName TEXT,
             action TEXT,
             timestamp INTEGER,
             FOREIGN KEY (memberId) REFERENCES guild_members(id)
@@ -150,15 +148,14 @@ async function storeMemberInDb(member) {
     // Store member data
     const sql = `
       INSERT OR REPLACE INTO guild_members (
-        id, username, displayName, avatarURL, joinedAt, joinedTimestamp, 
+        id, username, avatarURL, joinedAt, joinedTimestamp, 
         bot, lastUpdated, leftGuild
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `;
     
     db.run(sql, [
       member.id,
       member.user.username,
-      member.displayName || member.user.username,
       member.user.displayAvatarURL(),
       joinedAt,
       joinedTimestamp,
@@ -332,14 +329,13 @@ async function addRoleHistoryEntry(memberId, roleId, roleName, action) {
     
     const sql = `
       INSERT INTO role_history (
-        memberId, roleId, roleName, action, timestamp
-      ) VALUES (?, ?, ?, ?, ?)
+        memberId, roleId, action, timestamp
+      ) VALUES (?, ?, ?, ?)
     `;
     
     db.run(sql, [
       memberId,
       roleId,
-      roleName,
       action, // 'added' or 'removed'
       currentTime
     ], function(err) {
@@ -580,9 +576,9 @@ async function fetchMembersInChunks(guild, statusMessage) {
   // Prepare statements for better performance
   const memberStmt = db.prepare(`
     INSERT OR REPLACE INTO guild_members (
-      id, username, displayName, avatarURL, joinedAt, joinedTimestamp, 
+      id, username, avatarURL, joinedAt, joinedTimestamp, 
       bot, lastUpdated, leftGuild
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   
   const deleteRolesStmt = db.prepare(`
@@ -759,7 +755,6 @@ async function fetchMembersInChunks(guild, statusMessage) {
           memberStmt.run([
             memberId,
             user.username,
-            memberData.nick || user.username,
             user.avatar ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png` : null,
             joinedAt,
             joinedTimestamp,
@@ -1175,12 +1170,6 @@ async function cleanupWalFiles() {
   });
 }
 
-// Get formatted date time for logs
-function getFormattedDateTime() {
-  const now = new Date();
-  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
-}
-
 // Initialize member tracking
 function initializeMemberTracking(client) {
   console.log(`[${getFormattedDateTime()}] Member tracking initialized`);
@@ -1267,9 +1256,8 @@ function initializeMemberTracking(client) {
         }
       }
       
-      // Update member data in database with any changes in username/nickname
-      if (oldMember.displayName !== newMember.displayName || 
-          oldMember.user.username !== newMember.user.username) {
+      // Update member data in database with any changes in username
+      if (oldMember.user.username !== newMember.user.username) {
         await storeMemberInDb(newMember);
       }
       
