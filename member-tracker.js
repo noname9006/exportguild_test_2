@@ -39,8 +39,6 @@ async function initializeMemberDatabase(db) {
           memberId TEXT,
           roleId TEXT,
           roleName TEXT,
-          roleColor TEXT,
-          rolePosition INTEGER,
           addedAt INTEGER,
           PRIMARY KEY (memberId, roleId)
         )
@@ -213,8 +211,8 @@ async function storeMemberRolesInDb(member) {
       // Prepare batch insert
       const stmt = db.prepare(`
         INSERT INTO member_roles (
-          memberId, roleId, roleName, roleColor, rolePosition, addedAt
-        ) VALUES (?, ?, ?, ?, ?, ?)
+          memberId, roleId, roleName, addedAt
+        ) VALUES (?, ?, ?, ?)
       `);
       
       let successCount = 0;
@@ -225,8 +223,6 @@ async function storeMemberRolesInDb(member) {
           member.id,
           role.id,
           role.name,
-          role.hexColor,
-          role.position,
           currentTime
         ], function(err) {
           if (err) {
@@ -269,8 +265,8 @@ async function storeMemberRolesInDbBatch(members) {
     // Prepare insert statement for reuse
     const insertStmt = db.prepare(`
       INSERT INTO member_roles (
-        memberId, roleId, roleName, roleColor, rolePosition, addedAt
-      ) VALUES (?, ?, ?, ?, ?, ?)
+        memberId, roleId, roleName, addedAt
+      ) VALUES (?, ?, ?, ?)
     `);
     
     // Process each member
@@ -297,8 +293,6 @@ async function storeMemberRolesInDbBatch(members) {
           member.id,
           role.id,
           role.name,
-          role.hexColor,
-          role.position,
           currentTime
         );
         totalRolesAdded++;
@@ -588,8 +582,8 @@ async function fetchMembersInChunks(guild, statusMessage) {
   // Change to "INSERT OR IGNORE" to prevent unique constraint errors
   const roleStmt = db.prepare(`
     INSERT OR IGNORE INTO member_roles (
-      memberId, roleId, roleName, roleColor, rolePosition, addedAt
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      memberId, roleId, roleName, addedAt
+    ) VALUES (?, ?, ?, ?)
   `);
   
   console.log(`[${new Date().toISOString()}] Starting memory-efficient member fetch for guild ${guild.name} (${guild.id})`);
@@ -789,9 +783,7 @@ async function fetchMembersInChunks(guild, statusMessage) {
                   // Minimize the data we store in memory
                   role = {
                     id: guildRole.id,
-                    name: guildRole.name,
-                    hexColor: guildRole.hexColor,
-                    position: guildRole.position
+                    name: guildRole.name
                   };
                   // Store in cache
                   roleCache.set(roleId, role);
@@ -804,8 +796,6 @@ async function fetchMembersInChunks(guild, statusMessage) {
                   memberId,
                   role.id,
                   role.name,
-                  role.hexColor,
-                  role.position,
                   currentTime
                 ]);
                 
@@ -1269,7 +1259,7 @@ function initializeMemberTracking(client) {
     }
   });
   
-  // Listen for roleCreate events
+    // Listen for roleCreate events
   client.on('roleCreate', async (role) => {
     try {
       // Only process if database is initialized for this guild
@@ -1328,6 +1318,12 @@ function initializeMemberTracking(client) {
       console.error(`[${getFormattedDateTime()}] Error processing role update:`, error);
     }
   });
+}
+
+// Helper function to get formatted date and time
+function getFormattedDateTime() {
+  const now = new Date();
+  return now.toISOString();
 }
 
 // Export functions
