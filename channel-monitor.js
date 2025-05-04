@@ -35,6 +35,7 @@ function initializeChannelMonitoring(client) {
       }
 
       console.log(`[${getFormattedDateTime()}] New channel detected: ${channel.name} (${channel.id})`);
+      console.log(`Channel type: ${channel.type}, Parent ID: ${channel.parentId || 'None'}`);
 
       // Only process if a database is initialized for this guild
       const dbExists = monitor.checkDatabaseExists(channel.guild);
@@ -43,8 +44,8 @@ function initializeChannelMonitoring(client) {
         return;
       }
 
-      // Add channel to monitoring
-      await monitor.markChannelFetchingStarted(channel.id, channel.name);
+      // Add channel to monitoring - explicitly pass the full channel object
+      await monitor.markChannelFetchingStarted(channel.id, channel.name, channel);
       await monitor.markChannelFetchingCompleted(channel.id);
       console.log(`[${getFormattedDateTime()}] Added new channel to monitoring: ${channel.name} (${channel.id})`);
 
@@ -57,29 +58,23 @@ function initializeChannelMonitoring(client) {
   });
 
   // Listen for channel deletion events
-client.on('channelDelete', async (channel) => {
-  try {
-    // Only process channels in guilds (ignore DMs)
-    if (!channel.guild) return;
+  client.on('channelDelete', async (channel) => {
+    try {
+      // Only process channels in guilds (ignore DMs)
+      if (!channel.guild) return;
 
-    console.log(`[${getFormattedDateTime()}] Channel deleted: ${channel.name} (${channel.id})`);
-    
-    // Mark the channel as deleted in the database
-    await markChannelAsDeleted(channel.id, channel.name);
-    
-    // Optionally send a notification to a designated log channel
-    await sendNotification(client, channel, 'deleted');
-    
-  } catch (error) {
-    console.error(`[${getFormattedDateTime()}] Error processing deleted channel:`, error);
-  }
-});
-
-// Don't forget to export the function
-module.exports = {
-  initializeChannelMonitoring,
-  markChannelAsDeleted
-};
+      console.log(`[${getFormattedDateTime()}] Channel deleted: ${channel.name} (${channel.id})`);
+      
+      // Mark the channel as deleted in the database
+      await markChannelAsDeleted(channel.id, channel.name);
+      
+      // Optionally send a notification to a designated log channel
+      await sendNotification(client, channel, 'deleted');
+      
+    } catch (error) {
+      console.error(`[${getFormattedDateTime()}] Error processing deleted channel:`, error);
+    }
+  });
 
   // Listen for thread creation events
   client.on('threadCreate', async (thread) => {
@@ -97,6 +92,7 @@ module.exports = {
       }
 
       console.log(`[${getFormattedDateTime()}] New thread detected: ${thread.name} (${thread.id})`);
+      console.log(`Thread type: ${thread.type}, Parent ID: ${thread.parentId || 'None'}`);
 
       // Only process if a database is initialized for this guild
       const dbExists = monitor.checkDatabaseExists(thread.guild);
@@ -105,8 +101,8 @@ module.exports = {
         return;
       }
 
-      // Add thread to monitoring
-      await monitor.markChannelFetchingStarted(thread.id, thread.name);
+      // Add thread to monitoring - explicitly pass the full thread object
+      await monitor.markChannelFetchingStarted(thread.id, thread.name, thread);
       await monitor.markChannelFetchingCompleted(thread.id);
       console.log(`[${getFormattedDateTime()}] Added new thread to monitoring: ${thread.name} (${thread.id})`);
 
@@ -240,5 +236,6 @@ function getFormattedDateTime() {
 }
 
 module.exports = {
-  initializeChannelMonitoring
+  initializeChannelMonitoring,
+  markChannelAsDeleted
 };

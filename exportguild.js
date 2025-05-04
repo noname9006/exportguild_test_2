@@ -375,7 +375,7 @@ async function fetchMessagesFromChannel(channel, exportState, statusMessage, gui
   }
   
   // Now mark the channel as fetching started AFTER we've retrieved the lastStoredMessageId
-  await monitor.markChannelFetchingStarted(channel.id, channel.name);
+await monitor.markChannelFetchingStarted(channel.id, channel.name, channel);
   console.log(`Marked channel ${channel.name} (${channel.id}) for monitoring`);
   
   let lastMessageId = null;
@@ -1088,7 +1088,7 @@ async function handleExportGuild(message, client) {
     
     // If the channel exists and has a lastMessageId, use markChannelFetchingStarted
     // which will preserve the lastMessageId
-    await monitor.markChannelFetchingStarted(channel.id, channel.name);
+await monitor.markChannelFetchingStarted(channel.id, channel.name, channel);
     
     console.log(`Updated channel info for ${channel.name} (${channel.id})${
       channelInfo && channelInfo.lastMessageId ? ` with existing lastMessageId: ${channelInfo.lastMessageId}` : ''
@@ -1224,6 +1224,94 @@ const leftMembersResult = await memberLeft.processLeftMembers(guild, 200, true);
     clearInterval(statusUpdateTimer);
   }
 }
+
+async function fetchChannelMetadata(client, guildId) {
+  try {
+    console.log(`Fetching metadata for all channels in guild ${guildId}...`);
+    
+    // Fetch the guild
+    const guild = await client.guilds.fetch(guildId);
+    if (!guild) {
+      console.error(`Guild ${guildId} not found`);
+      return false;
+    }
+    
+    console.log(`Fetching channels for guild ${guild.name} (${guild.id})...`);
+    
+    // Fetch all channels (including threads)
+    await guild.channels.fetch();
+    
+    // Get channels from cache
+    const channels = Array.from(guild.channels.cache.values());
+    console.log(`Found ${channels.length} channels`);
+    
+    // Process each channel
+    let processedCount = 0;
+    
+    for (const channel of channels) {
+      try {
+        // Skip non-text channels except categories (needed for parentCatId)
+        const isTextChannel = channel.isTextBased && channel.isTextBased();
+        const isCategory = channel.type === ChannelType.GuildCategory; // 4 = GUILD_CATEGORY
+        
+        if (!isTextChannel && !isCategory) {
+          console.log(`Skipping non-text channel: ${channel.name} (${channel.id}, type: ${channel.type})`);
+          continue;
+        }
+        
+        console.log(`Processing channel ${channel.name} (${channel.id}, type: ${channel.type})`);
+        
+        // Explicitly fetch threads for text channels
+        if (isTextChannel && channel.threads && typeof channel.threads.fetch === 'function') {
+          try {
+            console.log(`Fetching threads for channel ${channel.name} (${channel.id})...`);
+            const threads = await channel.threads.fetch();
+            console.log(`Found ${threads?.threads?.size || 0} threads in channel ${channel.name}`);
+            
+            // Process each thread
+            if (threads && threads.threads) {
+              for (const [threadId, thread] of threads.threads) {
+                try {
+                  console.log(`Processing thread ${thread.name} (${thread.id})...`);
+                  await monitor.markChannelFetchingStarted(thread.id, thread.name, thread);
+                  // We don't need to call markChannelFetchingCompleted here
+                  // as we're just capturing metadata
+                } catch (threadError) {
+                  console.error(`Error processing thread ${threadId}:`, threadError);
+                }
+              }
+            }
+          } catch (threadsError) {
+            console.error(`Error fetching threads for channel ${channel.id}:`, threadsError);
+          }
+        }
+        
+        // Mark the channel itself with the full channel object
+        await monitor.markChannelFetchingStarted(channel.id, channel.name, channel);
+        
+        processedCount++;
+        if (processedCount % 10 === 0) {
+          console.log(`Processed ${processedCount}/${channels.length} channels...`);
+        }
+      } catch (channelError) {
+        console.error(`Error processing channel ${channel.id}:`, channelError);
+      }
+    }
+    
+    console.log(`Processed ${processedCount}/${channels.length} channels`);
+    return true;
+  } catch (error) {
+    console.error('Error fetching channel metadata:', error);
+    return false;
+  }
+}
+
+// Export functions - update this to include the new function
+module.exports = {
+  handleExportGuild,
+  extractMessageMetadata, // Still needed for other modules
+  fetchChannelMetadata    // Add the new function to exports
+};
 
 // Export functions
 module.exports = {

@@ -67,7 +67,69 @@ function checkDatabaseExists(guild = null) {
   }
 }
 
-// Initialize database
+// Ensure database tables exist with the correct structure
+function ensureTablesExist() {
+  return new Promise((resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    console.log('Checking and ensuring database tables exist with the correct structure...');
+    
+    // Check if channels table exists with the proper structure
+    db.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='channels'", (err, row) => {
+      if (err) {
+        console.error('Error checking for channels table:', err);
+        reject(err);
+        return;
+      }
+      
+      // If the table doesn't exist or needs to be recreated
+      if (!row || config.getConfig('forceRecreateChannelsTable', 'FORCE_RECREATE_CHANNELS_TABLE') === 'true') {
+        console.log('Creating/recreating channels table with new structure...');
+        
+        // Drop the existing table if it exists
+        db.run("DROP TABLE IF EXISTS channels", (err) => {
+          if (err) {
+            console.error('Error dropping channels table:', err);
+            reject(err);
+            return;
+          }
+          
+          // Create the table with the new structure
+          db.run(`
+            CREATE TABLE channels (
+              id TEXT PRIMARY KEY,
+              type INTEGER,
+              name TEXT,
+              parentChannelId TEXT,
+              parentCatId TEXT,
+              createdAt INTEGER,
+              lastMessageId TEXT,
+              deleted INTEGER DEFAULT 0,
+              deletedAt INTEGER,
+              fetchStarted INTEGER DEFAULT 0
+            )
+          `, function(err) {
+            if (err) {
+              console.error('Error creating channels table:', err);
+              reject(err);
+              return;
+            }
+            
+            console.log('Successfully created channels table with new structure');
+            resolve(true);
+          });
+        });
+      } else {
+        console.log('Channels table already exists');
+        resolve(true);
+      }
+    });
+  });
+}
+
 // Initialize database
 function initializeDatabase(guild = null) {
   return new Promise((resolve, reject) => {
@@ -109,26 +171,32 @@ function initializeDatabase(guild = null) {
         console.log('Using existing database');
         dbInitialized = true;
         
-        // Load previously fetched channels after database initialization
-        loadFetchedChannelsState().then(() => {
-          // Start message monitoring if not already running
-          if (!global.monitoringActive) {
-            global.monitoringActive = true;
-            console.log(`Monitoring activated for existing database: ${currentDbPath}`);
-            processMessageCache();
-          } else {
-            console.log(`Monitoring already active, continuing with existing process`);
-          }
-          resolve(true);
+        // Ensure tables exist with correct structure
+        ensureTablesExist().then(() => {
+          // Load previously fetched channels after database initialization
+          loadFetchedChannelsState().then(() => {
+            // Start message monitoring if not already running
+            if (!global.monitoringActive) {
+              global.monitoringActive = true;
+              console.log(`Monitoring activated for existing database: ${currentDbPath}`);
+              processMessageCache();
+            } else {
+              console.log(`Monitoring already active, continuing with existing process`);
+            }
+            resolve(true);
+          }).catch(err => {
+            console.error('Error loading channel states:', err);
+            // Still try to activate monitoring even if loading states fails
+            if (!global.monitoringActive) {
+              global.monitoringActive = true;
+              console.log(`Monitoring activated despite channel state loading error`);
+              processMessageCache();
+            }
+            resolve(true); // Still resolve even if loading channel states fails
+          });
         }).catch(err => {
-          console.error('Error loading channel states:', err);
-          // Still try to activate monitoring even if loading states fails
-          if (!global.monitoringActive) {
-            global.monitoringActive = true;
-            console.log(`Monitoring activated despite channel state loading error`);
-            processMessageCache();
-          }
-          resolve(true); // Still resolve even if loading channel states fails
+          console.error('Error ensuring tables exist:', err);
+          resolve(true); // Continue despite errors
         });
         return;
       }
@@ -136,52 +204,55 @@ function initializeDatabase(guild = null) {
       // Create messages table
       db.run(`
         CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    content TEXT,
-    authorId TEXT,
-    authorUsername TEXT,
-    authorBot INTEGER,
-    timestamp INTEGER,
-    createdAt TEXT,
-    channelId TEXT,
-    attachmentsJson TEXT,
-    embedsJson TEXT,
-    reactionsJson TEXT,
-    sticker_items TEXT,
-    edited_timestamp TEXT,
-    tts INTEGER,
-    mention_everyone INTEGER,
-    mentions TEXT,
-    mention_roles TEXT,
-    mention_channels TEXT,
-    type INTEGER,
-    message_reference TEXT,
-    flags INTEGER
-  )
-`, (err) => {
-  if (err) {
-    console.error('Error creating messages table:', err);
-    reject(err);
-    return;
-  }
+          id TEXT PRIMARY KEY,
+          content TEXT,
+          authorId TEXT,
+          authorUsername TEXT,
+          authorBot INTEGER,
+          timestamp INTEGER,
+          createdAt TEXT,
+          channelId TEXT,
+          attachmentsJson TEXT,
+          embedsJson TEXT,
+          reactionsJson TEXT,
+          sticker_items TEXT,
+          edited_timestamp TEXT,
+          tts INTEGER,
+          mention_everyone INTEGER,
+          mentions TEXT,
+          mention_roles TEXT,
+          mention_channels TEXT,
+          type INTEGER,
+          message_reference TEXT,
+          flags INTEGER
+        )
+      `, (err) => {
+        if (err) {
+          console.error('Error creating messages table:', err);
+          reject(err);
+          return;
+        }
         
-        // Create channels table to track which channels have been fetched
-        // Removed fetchCompleted and lastFetchTimestamp fields
+        // Create channels table with the new structure
         db.run(`
-  CREATE TABLE IF NOT EXISTS channels (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    fetchStarted INTEGER DEFAULT 0,
-    lastMessageId TEXT,
-    deleted INTEGER DEFAULT 0,
-    deletedAt INTEGER
-  )
-`, (err) => {
-  if (err) {
-    console.error('Error creating channels table:', err);
-    reject(err);
-    return;
-  }
+          CREATE TABLE IF NOT EXISTS channels (
+            id TEXT PRIMARY KEY,
+            type INTEGER,
+            name TEXT,
+            parentChannelId TEXT,
+            parentCatId TEXT,
+            createdAt INTEGER,
+            lastMessageId TEXT,
+            deleted INTEGER DEFAULT 0,
+            deletedAt INTEGER,
+            fetchStarted INTEGER DEFAULT 0
+          )
+        `, (err) => {
+          if (err) {
+            console.error('Error creating channels table:', err);
+            reject(err);
+            return;
+          }
           
           // Add metadata table for guild information
           db.run(`
@@ -608,8 +679,8 @@ async function storeMessagesInDbBatch(messages) {
   });
 }
 
-// Mark channel as fetching started
-function markChannelFetchingStarted(channelId, channelName) {
+// Mark channel as fetching started - Updated to include new fields
+function markChannelFetchingStarted(channelId, channelName, channel) {
   return new Promise((resolve, reject) => {
     if (!db) {
       reject(new Error("Database not initialized"));
@@ -617,6 +688,81 @@ function markChannelFetchingStarted(channelId, channelName) {
     }
     
     fetchingInProgress.add(channelId);
+    
+    console.log(`Extracting metadata for channel ${channelName} (${channelId})`);
+    
+    // Extract channel metadata with detailed debugging
+    let channelType = null;
+    let parentChannelId = null;
+    let parentCatId = null;
+    let createdAt = null;
+    
+    if (channel) {
+      console.log(`Channel object provided:`, 
+        JSON.stringify({
+          id: channel.id,
+          name: channel.name,
+          type: channel.type,
+          parentId: channel.parentId,
+          parentType: channel.parent ? channel.parent.type : 'none',
+          createdTimestamp: channel.createdTimestamp
+        }, null, 2)
+      );
+      
+      // Extract channel type (using numeric value)
+      channelType = channel.type;
+      console.log(`Channel type (raw): ${channelType}`);
+      
+      // IMPORTANT: For text channels (type 0), DON'T set parentChannelId, only parentCatId
+      // For threads, set parentChannelId to the parent channel
+      
+      // Step 1: Determine if this is a thread
+      const isThread = (
+          channel.type === 11 || // GUILD_PUBLIC_THREAD
+          channel.type === 12 || // GUILD_PRIVATE_THREAD
+          channel.type === 10 || // NEWS_THREAD
+          channel.type === 5  || // GUILD_ANNOUNCEMENT_THREAD
+          (channel.isThread === true)
+      );
+      
+      // Step 2: Set parentChannelId ONLY for threads
+      if (isThread && channel.parentId) {
+          parentChannelId = channel.parentId;
+          console.log(`Thread parent channel ID: ${parentChannelId}`);
+      } else {
+          // For non-threads, explicitly set to null
+          parentChannelId = null;
+          console.log(`Not a thread, no parent channel ID set`);
+      }
+      
+      // Find the parent category ID (for all channel types)
+      if (channel.parent) {
+        console.log(`Parent info: type=${channel.parent.type}, id=${channel.parent.id}, name=${channel.parent.name}`);
+        
+        // If the parent is a category (type 4 or GUILD_CATEGORY)
+        if (channel.parent.type === 4) {
+          parentCatId = channel.parent.id;
+          console.log(`Parent is a category: ${parentCatId}`);
+        } 
+        // If parent is not a category, try to find its parent
+        else if (channel.parent.parent) {
+          console.log(`Parent's parent info: type=${channel.parent.parent.type}, id=${channel.parent.parent.id}`);
+          if (channel.parent.parent.type === 4) {
+            parentCatId = channel.parent.parent.id;
+            console.log(`Found category in parent's parent: ${parentCatId}`);
+          }
+        }
+      }
+      
+      // Extract creation timestamp
+      createdAt = channel.createdTimestamp;
+      console.log(`Channel created at (timestamp): ${createdAt}`);
+      if (createdAt) {
+        console.log(`Channel created at (readable): ${new Date(createdAt).toISOString()}`);
+      }
+    } else {
+      console.log(`No channel object provided for ${channelName} (${channelId})`);
+    }
     
     // First, check if we already have a lastMessageId for this channel
     const checkSql = `
@@ -635,22 +781,24 @@ function markChannelFetchingStarted(channelId, channelName) {
       // Get any existing lastMessageId
       const existingLastMessageId = row ? row.lastMessageId : null;
       
-      // Now update the channel but preserve lastMessageId if it exists
-      const updateSql = existingLastMessageId
-        ? `
-          INSERT OR REPLACE INTO channels 
-          (id, name, fetchStarted, lastMessageId) 
-          VALUES (?, ?, ?, ?)
-        `
-        : `
-          INSERT OR REPLACE INTO channels 
-          (id, name, fetchStarted) 
-          VALUES (?, ?, ?)
-        `;
+      // Now update the channel with new fields and preserve lastMessageId if it exists
+      const updateSql = `
+        INSERT OR REPLACE INTO channels 
+        (id, type, name, parentChannelId, parentCatId, createdAt, lastMessageId, deleted, deletedAt, fetchStarted) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, 1)
+      `;
       
-      const params = existingLastMessageId
-        ? [channelId, channelName, 1, existingLastMessageId]
-        : [channelId, channelName, 1];
+      const params = [
+        channelId, 
+        channelType, 
+        channelName, 
+        parentChannelId, 
+        parentCatId, 
+        createdAt, 
+        existingLastMessageId
+      ];
+      
+      console.log(`SQL parameters:`, JSON.stringify(params, null, 2));
       
       db.run(updateSql, params, function(err) {
         if (err) {
@@ -660,6 +808,7 @@ function markChannelFetchingStarted(channelId, channelName) {
         }
         
         console.log(`Marked channel ${channelName} (${channelId}) as fetching started${existingLastMessageId ? ` with existing lastMessageId: ${existingLastMessageId}` : ''}`);
+        console.log(`Channel data stored: type=${channelType}, parentChannelId=${parentChannelId}, parentCatId=${parentCatId}, createdAt=${createdAt}`);
         resolve(true);
       });
     });
@@ -696,10 +845,10 @@ function markChannelFetchingCompleted(channelId, lastMessageId = null) {
         channelName = row.name;
       }
       
-      // Update SQL to set fetchStarted to 1 and lastMessageId
+      // Update SQL to set lastMessageId but don't touch other fields
       const sql = `
         UPDATE channels 
-        SET fetchStarted = 1, lastMessageId = ?
+        SET lastMessageId = ?
         WHERE id = ?
       `;
       
@@ -851,7 +1000,7 @@ function checkForDuplicates() {
   });
 }
 
-// Get channels that have been fetched
+// Get channels that have been fetched - Updated to include new fields
 async function getFetchedChannels() {
   return new Promise((resolve, reject) => {
     if (!db) {
@@ -860,9 +1009,9 @@ async function getFetchedChannels() {
       return;
     }
     
-    // Update SQL removing fetchCompleted and lastFetchTimestamp fields
+    // Updated SQL to include new fields
     const sql = `
-      SELECT id, name, fetchStarted, lastMessageId
+      SELECT id, type, name, parentChannelId, parentCatId, createdAt, lastMessageId, deleted, deletedAt, fetchStarted
       FROM channels
       WHERE fetchStarted = 1
     `;
@@ -904,6 +1053,100 @@ async function loadFetchedChannelsState() {
   } catch (error) {
     console.error('Error loading fetched channels state:', error);
   }
+}
+
+// Add this function to update metadata for existing channels
+async function updateExistingChannelMetadata(client) {
+  return new Promise(async (resolve, reject) => {
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+
+    console.log('Updating metadata for existing channels...');
+    
+    // Get all channels from the database
+    db.all("SELECT id, name FROM channels", [], async (err, rows) => {
+      if (err) {
+        console.error('Error getting channels for metadata update:', err);
+        reject(err);
+        return;
+      }
+      
+      console.log(`Found ${rows.length} channels to update metadata`);
+      let successCount = 0;
+      let errorCount = 0;
+      
+      for (const row of rows) {
+        try {
+          // Try to fetch the channel from Discord
+          const channel = await client.channels.fetch(row.id).catch(e => {
+            console.log(`Could not fetch channel ${row.id}: ${e.message}`);
+            return null;
+          });
+          
+          if (channel) {
+            console.log(`Updating metadata for channel ${channel.name} (${channel.id})`);
+            
+            // Extract channel metadata
+            const channelType = channel.type;
+            const parentChannelId = channel.parentId || null;
+            let parentCatId = null;
+            
+            // Find the parent category
+            if (channel.parent) {
+              if (channel.parent.type === 4) {
+                parentCatId = channel.parent.id;
+              } else if (channel.parent.parent && channel.parent.parent.type === 4) {
+                parentCatId = channel.parent.parent.id;
+              }
+            }
+            
+            const createdAt = channel.createdTimestamp;
+            
+            // Update the channel metadata
+            const sql = `
+              UPDATE channels
+              SET type = ?, 
+                  parentChannelId = ?, 
+                  parentCatId = ?, 
+                  createdAt = ?
+              WHERE id = ?
+            `;
+            
+            await new Promise((resolveUpdate, rejectUpdate) => {
+              db.run(sql, [channelType, parentChannelId, parentCatId, createdAt, channel.id], function(updateErr) {
+                if (updateErr) {
+                  console.error(`Error updating metadata for channel ${channel.id}:`, updateErr);
+                  rejectUpdate(updateErr);
+                  return;
+                }
+                
+                if (this.changes > 0) {
+                  console.log(`Updated metadata for channel ${channel.name} (${channel.id}): type=${channelType}, parentChannelId=${parentChannelId}, parentCatId=${parentCatId}, createdAt=${createdAt}`);
+                  resolveUpdate(true);
+                } else {
+                  console.log(`No changes made for channel ${channel.id}`);
+                  resolveUpdate(false);
+                }
+              });
+            });
+            
+            successCount++;
+          } else {
+            console.log(`Channel ${row.id} not found, may be deleted`);
+            errorCount++;
+          }
+        } catch (error) {
+          console.error(`Error processing channel ${row.id}:`, error);
+          errorCount++;
+        }
+      }
+      
+      console.log(`Metadata update complete: ${successCount} channels updated, ${errorCount} errors`);
+      resolve({ success: successCount, errors: errorCount });
+    });
+  });
 }
 
 function shouldMonitorChannel(channelId) {
@@ -979,5 +1222,7 @@ module.exports = {
   getCurrentDatabasePath,
   getCurrentDatabaseFilename,
   getDatabase,
-  fixExistingLastMessageIds
+  fixExistingLastMessageIds,
+  ensureTablesExist,
+  updateExistingChannelMetadata
 };

@@ -53,55 +53,65 @@ client.once('ready', async () => {
     }
     
     // For each guild the bot is connected to, check if a database exists
-for (const [guildId, guild] of client.guilds.cache) {
-  try {
-    // This will check if a database exists without creating one
-    const dbExists = monitor.checkDatabaseExists(guild);
-    if (dbExists) {
-      console.log(`Found existing database for guild ${guild.name} (${guild.id})`);
-      
-      // Initialize database with existing file
-      await monitor.initializeDatabase(guild);
-      
-      // Fix lastMessageId values for this specific guild's database
+    for (const [guildId, guild] of client.guilds.cache) {
       try {
-        await monitor.fixExistingLastMessageIds();
-        console.log(`Completed checking and fixing lastMessageId values for guild ${guild.name} (${guild.id})`);
+        // This will check if a database exists without creating one
+        const dbExists = monitor.checkDatabaseExists(guild);
+        if (dbExists) {
+          console.log(`Found existing database for guild ${guild.name} (${guild.id})`);
+          
+          // Initialize database with existing file
+          await monitor.initializeDatabase(guild);
+          
+          // Get the database instance from monitor
+          const db = monitor.getDatabase();
+          
+          // Disable WAL mode
+          if (db) {
+            db.exec("PRAGMA journal_mode = DELETE;", function(err) {
+              if (err) {
+                console.error("Failed to disable WAL mode:", err);
+              } else {
+                console.log("Disabled WAL mode, using standard journal mode");
+              }
+            });
+          }
+          
+          // Fix lastMessageId values for this specific guild's database
+          try {
+            await monitor.fixExistingLastMessageIds();
+            console.log(`Completed checking and fixing lastMessageId values for guild ${guild.name} (${guild.id})`);
+          } catch (error) {
+            console.error(`Error fixing lastMessageId values for guild ${guild.name} (${guild.id}):`, error);
+          }
+          
+          // Initialize WAL manager with the database from monitor
+          if (db) {
+            await walManager.initialize(client, db);
+            
+            // Initialize member tracking tables in the database
+            await memberTracker.initializeMemberDatabase(db);
+            
+            // Mark guild as initialized
+            initializedGuilds.add(guildId);
+            console.log(`Database initialized for guild ${guild.name} (${guild.id}), monitoring active`);
+          } else {
+            console.error(`Database not available for guild ${guild.name} after initialization`);
+          }
+        } else {
+          console.log(`No database found for guild ${guild.name} (${guild.id}). Will create one when !exportguild is used.`);
+        }
       } catch (error) {
-        console.error(`Error fixing lastMessageId values for guild ${guild.name} (${guild.id}):`, error);
+        console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
       }
-      
-      // Get the database instance from monitor instead of using global db
-      const db = monitor.getDatabase();
-      
-      // Initialize WAL manager with the database from monitor
-      if (db) {
-        await walManager.initialize(client, db);
-        
-        // Initialize member tracking tables in the database
-        await memberTracker.initializeMemberDatabase(db);
-        
-        // Mark guild as initialized
-        initializedGuilds.add(guildId);
-        console.log(`Database initialized for guild ${guild.name} (${guild.id}), monitoring active`);
-      } else {
-        console.error(`Database not available for guild ${guild.name} after initialization`);
-      }
-    } else {
-      console.log(`No database found for guild ${guild.name} (${guild.id}). Will create one when !exportguild is used.`);
     }
-  } catch (error) {
-    console.error(`Error checking database for guild ${guild.name} (${guild.id}):`, error);
-  }
-}
 
-	  
     // Initialize auto-vacuum schedule
     autoVacuum.initializeAutoVacuum(client, {
       // You can add a log channel ID if you want vacuum notifications in a specific channel
       // logChannelId: 'YOUR_LOG_CHANNEL_ID' 
     });
-	
+    
     // Initialize channel monitoring
     if (config.getConfig('channelMonitoringEnabled', 'CHANNEL_MONITORING_ENABLED')) {
       channelMonitor.initializeChannelMonitoring(client);
@@ -117,8 +127,6 @@ for (const [guildId, guild] of client.guilds.cache) {
   } catch (error) {
     console.error('Error during startup:', error);
   }
-  
-  
 });
 
 // Function to handle excluded channels commands
@@ -309,9 +317,30 @@ function getFormattedDateTime() {
 }
 
 // Command handler
-client.on('messageCreate', async (message) => {
-  // Ignore messages from bots for both commands and monitoring
+client.on('messageCreate', async message => {
+  // Skip messages from bots
   if (message.author.bot) return;
+  
+  // Check command and permissions
+  if (message.content === '!updatechannelmeta' && message.member.permissions.has('Administrator')) {
+    try {
+      const progressMessage = await message.channel.send('📊 Updating channel metadata... This may take a while for servers with many channels.');
+      
+      // Use the new function to update metadata
+      const exportguild = require('./exportguild.js');
+      const result = await exportguild.fetchChannelMetadata(client, message.guild.id);
+      
+      if (result) {
+        await progressMessage.edit('✅ Channel metadata update completed successfully!');
+      } else {
+        await progressMessage.edit('❌ Error updating channel metadata. Check bot logs for details.');
+      }
+    } catch (error) {
+      console.error('Error in updatechannelmeta command:', error);
+      message.channel.send('⚠️ An error occurred while updating channel metadata. Check the bot logs for details.');
+    }
+    return;
+  }
   
   const guildId = message.guildId;
   
@@ -397,8 +426,21 @@ client.on('messageCreate', async (message) => {
           try {
             await monitor.initializeDatabase(message.guild);
             
-            // Get the database from monitor and initialize WAL manager
+            // Get the database from monitor
             const db = monitor.getDatabase();
+            
+            // Disable WAL mode
+            if (db) {
+              db.exec("PRAGMA journal_mode = DELETE;", function(err) {
+                if (err) {
+                  console.error("Failed to disable WAL mode:", err);
+                } else {
+                  console.log("Disabled WAL mode, using standard journal mode");
+                }
+              });
+            }
+            
+            // Get the database from monitor and initialize WAL manager
             if (db) {
               await walManager.initialize(client, db);
               
@@ -544,40 +586,38 @@ client.on('messageCreate', async (message) => {
               }
 
               db.all(`SELECT COUNT(*) as totalRoles FROM guild_roles WHERE deleted = 0`, [], async (err, roleCountResult) => {
-  if (err) throw err;
+                if (err) throw err;
 
-  db.all(`SELECT name, color, position, mentionable, hoist FROM guild_roles WHERE deleted = 0 ORDER BY position DESC LIMIT 15`, [], async (err, roleDetailResult) => {
-    if (err) throw err;
-    
-    // Add this to your response:
-    response += `\n## Role Statistics\n`;
-    response += `**Total Roles:** ${roleCountResult[0].totalRoles}\n\n`;
-    
-    if (roleDetailResult.length > 0) {
-      response += `### Top ${roleDetailResult.length} Roles (by hierarchy)\n`;
-      roleDetailResult.forEach(role => {
-        // Add emoji indicators for special properties
-        const hoistEmoji = role.hoist ? '📌' : ''; // Hoisted/displayed separately
-        const mentionEmoji = role.mentionable ? '🔔' : ''; // Mentionable
-        
-        response += `- ${hoistEmoji}${mentionEmoji} **${role.name}** (Position: ${role.position})\n`;
-      });
-    } else {
-      response += "*No role data available*\n";
-    }
-    
-    // Continue with updating the status message
-  });
-});
-			  
-              // Add timestamp to the report
-              response += `\n\n*Report generated: ${getFormattedDateTime()} UTC*`;
-              
-              // Update the status message with the statistics
-              await statusMessage.edit(response);
-              
-              // Log successful completion
-              console.log(`[${getFormattedDateTime()}] Completed: !memberstats for ${message.guild.name} (${message.guild.id})`);
+                db.all(`SELECT name, color, position, mentionable, hoist FROM guild_roles WHERE deleted = 0 ORDER BY position DESC LIMIT 15`, [], async (err, roleDetailResult) => {
+                  if (err) throw err;
+                  
+                  // Add this to your response:
+                  response += `\n## Role Statistics\n`;
+                  response += `**Total Roles:** ${roleCountResult[0].totalRoles}\n\n`;
+                  
+                  if (roleDetailResult.length > 0) {
+                    response += `### Top ${roleDetailResult.length} Roles (by hierarchy)\n`;
+                    roleDetailResult.forEach(role => {
+                      // Add emoji indicators for special properties
+                      const hoistEmoji = role.hoist ? '📌' : ''; // Hoisted/displayed separately
+                      const mentionEmoji = role.mentionable ? '🔔' : ''; // Mentionable
+                      
+                      response += `- ${hoistEmoji}${mentionEmoji} **${role.name}** (Position: ${role.position})\n`;
+                    });
+                  } else {
+                    response += "*No role data available*\n";
+                  }
+                  
+                  // Add timestamp to the report
+                  response += `\n\n*Report generated: ${getFormattedDateTime()} UTC*`;
+                  
+                  // Update the status message with the statistics
+                  await statusMessage.edit(response);
+                  
+                  // Log successful completion
+                  console.log(`[${getFormattedDateTime()}] Completed: !memberstats for ${message.guild.name} (${message.guild.id})`);
+                });
+              });
             });
           });
         });
