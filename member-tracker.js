@@ -200,48 +200,213 @@ async function storeMemberRolesInDb(member) {
       return;
     }
     
-    // Remove existing roles for this member before adding current ones
-    db.run(`DELETE FROM member_roles WHERE memberId = ?`, [member.id], function(err) {
+    // Get current role IDs for comparison
+    const newRoleIds = new Set(filteredRoles.map(role => role.id));
+    
+    // First get existing roles
+    db.all(`SELECT roleId, roleName, addedAt FROM member_roles WHERE memberId = ?`, [member.id], (err, existingRoles) => {
       if (err) {
-        console.error(`Error clearing existing roles for member ${member.id}:`, err);
+        console.error(`Error fetching existing roles for member ${member.id}:`, err);
         reject(err);
         return;
       }
       
-      // Prepare batch insert
-      const stmt = db.prepare(`
-        INSERT INTO member_roles (
-          memberId, roleId, roleName, addedAt
-        ) VALUES (?, ?, ?, ?)
-      `);
+      // Create set of existing role IDs and a map of role ID to timestamp
+      const existingRoleIds = new Set();
+      const roleTimestamps = {};
       
-      let successCount = 0;
+      existingRoles.forEach(role => {
+        existingRoleIds.add(role.roleId);
+        roleTimestamps[role.roleId] = role.addedAt;
+      });
       
-      // Insert each role
-      for (const role of filteredRoles) {
-        stmt.run([
-          member.id,
-          role.id,
-          role.name,
-          currentTime
-        ], function(err) {
-          if (err) {
-            console.error(`Error storing role ${role.name} for member ${member.user.username}:`, err);
-          } else {
-            successCount++;
-          }
-        });
-      }
+      // Identify roles to remove (in existing but not in new set)
+      const rolesToRemove = Array.from(existingRoleIds).filter(id => !newRoleIds.has(id));
       
-      stmt.finalize(err => {
-        if (err) {
-          reject(err);
-        } else {
-          console.log(`Stored ${successCount} roles for member ${member.user.username} (${member.id})`);
-          resolve(successCount);
+      // Identify roles to add (in new but not in existing set)
+      const rolesToAdd = filteredRoles.filter(role => !existingRoleIds.has(role.id));
+      
+      // Begin transaction
+      db.run('BEGIN TRANSACTION', transErr => {
+        if (transErr) {
+          console.error(`Error beginning transaction for member ${member.id}:`, transErr);
+          reject(transErr);
+          return;
         }
+        
+        let successCount = 0;
+        let promiseChain = Promise.resolve();
+        
+        // Remove roles that are no longer assigned
+        if (rolesToRemove.length > 0) {
+          const placeholders = rolesToRemove.map(() => '?').join(',');
+          const deleteQuery = `DELETE FROM member_roles WHERE memberId = ? AND roleId IN (${placeholders})`;
+          
+          promiseChain = promiseChain.then(() => {
+            return new Promise((resolveDelete, rejectDelete) => {
+              db.run(deleteQuery, [member.id, ...rolesToRemove], function(deleteErr) {
+                if (deleteErr) {
+                  console.error(`Error removing old roles for member ${member.user.username}:`, deleteErr);
+                  rejectDelete(deleteErr);
+                  return;
+                }
+                console.log(`Removed ${this.changes} old roles for ${member.user.username}`);
+                resolveDelete();
+              });
+            });
+          });
+        }
+        
+        // Add new roles
+        if (rolesToAdd.length > 0) {
+          const insertStmt = db.prepare(`
+            INSERT INTO member_roles (memberId, roleId, roleName, addedAt)
+            VALUES (?, ?, ?, ?)
+          `);
+          
+          promiseChain = promiseChain.then(() => {
+            return new Promise((resolveInserts, rejectInserts) => {
+              let insertPromises = [];
+              
+              for (const role of rolesToAdd) {
+                insertPromises.push(new Promise((resolveInsert) => {
+                  insertStmt.run([
+                    member.id,
+                    role.id,
+                    role.name,
+                    currentTime // New roles get current timestamp
+                  ], function(insertErr) {
+                    if (insertErr) {
+                      console.error(`Error adding new role ${role.name} for member ${member.user.username}:`, insertErr);
+                    } else {
+                      successCount++;
+                    }
+                    resolveInsert();
+                  });
+                }));
+              }
+              
+              Promise.all(insertPromises)
+                .then(() => {
+                  insertStmt.finalize();
+                  resolveInserts();
+                })
+                .catch(err => rejectInserts(err));
+            });
+          });
+        }
+        
+        // Commit transaction after all operations
+        promiseChain
+          .then(() => {
+            return new Promise((resolveCommit, rejectCommit) => {
+              db.run('COMMIT', commitErr => {
+                if (commitErr) {
+                  console.error(`Error committing transaction for member ${member.id}:`, commitErr);
+                  db.run('ROLLBACK');
+                  rejectCommit(commitErr);
+                  return;
+                }
+                console.log(`Successfully updated roles for ${member.user.username}: added ${rolesToAdd.length}, removed ${rolesToRemove.length}`);
+                resolveCommit();
+              });
+            });
+          })
+          .then(() => {
+            resolve(successCount);
+          })
+          .catch(finalErr => {
+            db.run('ROLLBACK');
+            reject(finalErr);
+          });
       });
     });
+  });
+}
+
+// Also modify storeMemberRolesInDbBatch to use the same approach
+async function storeMemberRolesInDbBatch(members) {
+  return new Promise((resolve, reject) => {
+    const db = monitor.getDatabase();
+    if (!db) {
+      reject(new Error("Database not initialized"));
+      return;
+    }
+    
+    const currentTime = Date.now();
+    let totalRolesAdded = 0;
+    let totalRolesRemoved = 0;
+    let processedMembers = 0;
+    
+    // Process each member sequentially to avoid transaction conflicts
+    const processMember = async (index) => {
+      if (index >= members.length) {
+        // All members processed
+        console.log(`Successfully processed roles for ${processedMembers} members: ${totalRolesAdded} added, ${totalRolesRemoved} removed`);
+        resolve(totalRolesAdded);
+        return;
+      }
+      
+      const member = members[index];
+      
+      if (!member || !member.roles || !member.roles.cache) {
+        console.log(`Skipping invalid member`);
+        processMember(index + 1);
+        return;
+      }
+      
+      try {
+        // First, get existing roles for this member
+        const existingRoles = await new Promise((resolveQuery, rejectQuery) => {
+          db.all(`SELECT roleId FROM member_roles WHERE memberId = ?`, [member.id], (err, rows) => {
+            if (err) rejectQuery(err);
+            else resolveQuery(rows || []);
+          });
+        });
+        
+        const existingRoleIds = new Set(existingRoles.map(row => row.roleId));
+        
+        // Get current roles (excluding @everyone)
+        const currentRoles = Array.from(member.roles.cache.values())
+          .filter(role => role.id !== member.guild.id);
+        
+        const currentRoleIds = new Set(currentRoles.map(role => role.id));
+        
+        // Find roles to add and remove
+        const rolesToAdd = currentRoles.filter(role => !existingRoleIds.has(role.id));
+        const roleIdsToRemove = [...existingRoleIds].filter(id => !currentRoleIds.has(id));
+        
+        // Process removals
+        for (const roleId of roleIdsToRemove) {
+          await new Promise((resolveRemove, rejectRemove) => {
+            db.run(`DELETE FROM member_roles WHERE memberId = ? AND roleId = ?`, 
+                   [member.id, roleId], 
+                   err => err ? rejectRemove(err) : resolveRemove());
+          });
+          totalRolesRemoved++;
+        }
+        
+        // Process additions
+        for (const role of rolesToAdd) {
+          await new Promise((resolveAdd, rejectAdd) => {
+            db.run(`INSERT INTO member_roles (memberId, roleId, roleName, addedAt) VALUES (?, ?, ?, ?)`,
+                   [member.id, role.id, role.name, currentTime],
+                   err => err ? rejectAdd(err) : resolveAdd());
+          });
+          totalRolesAdded++;
+        }
+        
+        processedMembers++;
+        processMember(index + 1);
+      } catch (error) {
+        console.error(`Error processing roles for member ${member?.id}:`, error);
+        // Continue with next member despite errors
+        processMember(index + 1);
+      }
+    };
+    
+    // Start processing with the first member
+    processMember(0);
   });
 }
 
@@ -283,9 +448,6 @@ async function storeMemberRolesInDbBatch(members) {
         console.log(`Member ${member.user.username} has no roles to store (besides @everyone)`);
         continue;
       }
-      
-      // Delete existing roles
-      deleteStmt.run(member.id);
       
       // Insert each role
       for (const role of filteredRoles) {
@@ -756,10 +918,7 @@ async function fetchMembersInChunks(guild, statusMessage) {
             currentTime,
             0 // Not left guild
           ]);
-          
-          // Process roles - first delete existing
-          deleteRolesStmt.run(memberId);
-          
+                   
           // Track roles we've inserted for this member to avoid duplicates
           const insertedRoles = new Set();
           
@@ -1228,45 +1387,44 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     console.log(`[${getFormattedDateTime()}] Old roles: ${Array.from(oldRoles.values()).map(r => r.name).join(', ')}`);
     console.log(`[${getFormattedDateTime()}] New roles: ${Array.from(newRoles.values()).map(r => r.name).join(', ')}`);
     
+    // Find added roles (in new but not in old)
+    for (const [roleId, role] of newRoles) {
+      // Skip @everyone role
+      if (roleId === newMember.guild.id) continue;
       
-      // Find added roles (in new but not in old)
-      for (const [roleId, role] of newRoles) {
-        // Skip @everyone role
-        if (roleId === newMember.guild.id) continue;
+      if (!oldRoles.has(roleId)) {
+        console.log(`[${getFormattedDateTime()}] Role added to ${newMember.user.username}: ${role.name}`);
         
-        if (!oldRoles.has(roleId)) {
-          console.log(`[${getFormattedDateTime()}] Role added to ${newMember.user.username}: ${role.name}`);
-          
-          // Add to role history
-          await addRoleHistoryEntry(newMember.id, roleId, role.name, 'added');
-        }
+        // Add to role history
+        await addRoleHistoryEntry(newMember.id, roleId, role.name, 'added');
       }
-      
-      // Find removed roles (in old but not in new)
-      for (const [roleId, role] of oldRoles) {
-        // Skip @everyone role
-        if (roleId === newMember.guild.id) continue;
-        
-        if (!newRoles.has(roleId)) {
-          console.log(`[${getFormattedDateTime()}] Role removed from ${newMember.user.username}: ${role.name}`);
-          
-          // Add to role history
-          await addRoleHistoryEntry(newMember.id, roleId, role.name, 'removed');
-        }
-      }
-      
-      // Update member data in database with any changes in username
-      if (oldMember.user.username !== newMember.user.username) {
-        await storeMemberInDb(newMember);
-      }
-      
-      // Always update roles to ensure the database has the current state
-      await storeMemberRolesInDb(newMember);
-      
-    } catch (error) {
-      console.error(`[${getFormattedDateTime()}] Error processing member update:`, error);
     }
-  });
+    
+    // Find removed roles (in old but not in new)
+    for (const [roleId, role] of oldRoles) {
+      // Skip @everyone role
+      if (roleId === newMember.guild.id) continue;
+      
+      if (!newRoles.has(roleId)) {
+        console.log(`[${getFormattedDateTime()}] Role removed from ${newMember.user.username}: ${role.name}`);
+        
+        // Add to role history
+        await addRoleHistoryEntry(newMember.id, roleId, role.name, 'removed');
+      }
+    }
+    
+    // Update member data in database with any changes in username
+    if (oldMember.user.username !== newMember.user.username) {
+      await storeMemberInDb(newMember);
+    }
+    
+    // Update only the changed roles (using our new function)
+    await storeMemberRolesInDb(newMember);
+    
+  } catch (error) {
+    console.error(`[${getFormattedDateTime()}] Error processing member update:`, error);
+  }
+});
   
   client.on('debug', info => {
   if (info.includes('GUILD_MEMBER_UPDATE')) {
