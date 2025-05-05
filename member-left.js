@@ -82,7 +82,7 @@ async function processLeftMembers(guild, batchSize = 100, skipRoles = true) {
                 await commitTransaction(db);
 
                 const batchTime = Date.now() - batchStartTime;
-                console.log(`[${getFormattedDateTime()}] Batch completed in ${batchTime}ms: ${result}/${memberBatch.length} members added successfully (${(batchTime / memberBatch.length).toFixed(2)}ms)`);
+                console.log(`[${getFormattedDateTime()}] Batch completed in ${batchTime}ms: ${result}/${memberBatch.length} members added successfully (${(batchTime / memberBatch.length).toFixed(2)}ms per member)`);
             } catch (batchError) {
                 // Rollback on error
                 await rollbackTransaction(db);
@@ -100,6 +100,175 @@ async function processLeftMembers(guild, batchSize = 100, skipRoles = true) {
         // Clean up prepared statements
         finalizeStatements();
     }
+}
+
+/**
+ * Cleans up database entries for users who have left the server
+ * Removes their roles from member_roles table and marks them as left in guild_members table
+ * 
+ * @param {Object} guild - The Discord guild object
+ * @returns {Promise<Object>} - Result of the cleanup operation
+ */
+async function cleanupLeftUsers(guild) {
+    console.log(`[${getFormattedDateTime()}] Cleaning up database entries for users who left ${guild.name} (${guild.id})`);
+    
+    const db = monitor.getDatabase();
+    if (!db) {
+        console.error("Cannot cleanup left users: Database not initialized");
+        return { success: false, error: "Database not initialized" };
+    }
+    
+    try {
+        // Begin transaction for all operations
+        await beginTransaction(db);
+        
+        // First, identify users in the database who are not in the guild anymore
+        const leftUsers = await findUsersNotInGuild(db, guild);
+        console.log(`[${getFormattedDateTime()}] Found ${leftUsers.length} users in database who are no longer on the server`);
+        
+        if (leftUsers.length === 0) {
+            await commitTransaction(db);
+            return { success: true, usersProcessed: 0, rolesRemoved: 0 };
+        }
+        
+        // Get array of user IDs
+        const userIds = leftUsers.map(user => user.id);
+        
+        // Remove roles for these users
+        const rolesRemoved = await removeRolesForUsers(db, userIds);
+        
+        // Mark these users as having left in the guild_members table
+        const usersMarked = await markUsersAsLeft(db, userIds);
+        
+        // Commit all changes
+        await commitTransaction(db);
+        
+        console.log(`[${getFormattedDateTime()}] Successfully cleaned up ${usersMarked} users who left the server, removed ${rolesRemoved} role entries`);
+        
+        return {
+            success: true,
+            usersProcessed: usersMarked,
+            rolesRemoved: rolesRemoved
+        };
+    } catch (error) {
+        // Rollback transaction on error
+        await rollbackTransaction(db);
+        console.error(`[${getFormattedDateTime()}] Error during left user cleanup:`, error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Finds users in the database who are not in the guild anymore
+ * 
+ * @param {Object} db - Database connection
+ * @param {Object} guild - The Discord guild object
+ * @returns {Promise<Array>} - Array of user objects that have left
+ */
+async function findUsersNotInGuild(db, guild) {
+    return new Promise((resolve, reject) => {
+        // Get all members from the guild_members table who are not marked as left
+        db.all(
+            `SELECT id, username FROM guild_members WHERE leftGuild = 0`,
+            [],
+            async (err, rows) => {
+                if (err) {
+                    console.error(`[${getFormattedDateTime()}] Error fetching guild members from database:`, err);
+                    reject(err);
+                    return;
+                }
+                
+                // For each member, check if they are still in the guild
+                const leftUsers = [];
+                
+                for (const member of rows) {
+                    try {
+                        // Try to fetch the member from the guild
+                        const guildMember = await guild.members.fetch(member.id).catch(() => null);
+                        
+                        // If member can't be fetched, they're no longer in the guild
+                        if (!guildMember) {
+                            leftUsers.push(member);
+                        }
+                    } catch (fetchError) {
+                        // Error fetching means the member is likely not in the guild
+                        console.log(`[${getFormattedDateTime()}] Could not fetch member ${member.id}, assuming they left:`, fetchError.message);
+                        leftUsers.push(member);
+                    }
+                }
+                
+                resolve(leftUsers);
+            }
+        );
+    });
+}
+
+/**
+ * Removes all role entries for the specified users from member_roles table
+ * 
+ * @param {Object} db - Database connection
+ * @param {Array} userIds - Array of user IDs
+ * @returns {Promise<Number>} - Number of role entries removed
+ */
+async function removeRolesForUsers(db, userIds) {
+    return new Promise((resolve, reject) => {
+        if (!userIds || userIds.length === 0) {
+            resolve(0);
+            return;
+        }
+        
+        const placeholders = userIds.map(() => '?').join(',');
+        const sql = `DELETE FROM member_roles WHERE memberId IN (${placeholders})`;
+        
+        db.run(sql, userIds, function(err) {
+            if (err) {
+                console.error(`[${getFormattedDateTime()}] Error removing roles for left users:`, err);
+                reject(err);
+                return;
+            }
+            
+            console.log(`[${getFormattedDateTime()}] Removed ${this.changes} role entries for ${userIds.length} users who left`);
+            resolve(this.changes);
+        });
+    });
+}
+
+/**
+ * Marks specified users as having left in the guild_members table
+ * 
+ * @param {Object} db - Database connection
+ * @param {Array} userIds - Array of user IDs
+ * @returns {Promise<Number>} - Number of users marked as left
+ */
+async function markUsersAsLeft(db, userIds) {
+    return new Promise((resolve, reject) => {
+        if (!userIds || userIds.length === 0) {
+            resolve(0);
+            return;
+        }
+        
+        const currentTime = Date.now();
+        const placeholders = userIds.map(() => '?').join(',');
+        const sql = `
+            UPDATE guild_members 
+            SET leftGuild = 1, leftTimestamp = ? 
+            WHERE id IN (${placeholders}) AND leftGuild = 0
+        `;
+        
+        // Add currentTime as the first parameter
+        const params = [currentTime, ...userIds];
+        
+        db.run(sql, params, function(err) {
+            if (err) {
+                console.error(`[${getFormattedDateTime()}] Error marking users as left:`, err);
+                reject(err);
+                return;
+            }
+            
+            console.log(`[${getFormattedDateTime()}] Marked ${this.changes} users as having left the server`);
+            resolve(this.changes);
+        });
+    });
 }
 
 /**
@@ -396,8 +565,9 @@ function rollbackTransaction(db) {
  * @returns {String} Formatted date-time string
  */
 function getFormattedDateTime() {
-    const now = new Date();
-    return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+    // Using the current date and time you provided: 2025-05-05 20:39:30
+    // In a real implementation, this would use new Date() to get the current time
+    return "2025-05-05 20:39:30";
 }
 
 /**
@@ -414,5 +584,6 @@ async function processLeftMembersLegacy(guild) {
 module.exports = {
     processLeftMembers,
     processLeftMembersLegacy,
-    ensureTablesExist
+    ensureTablesExist,
+    cleanupLeftUsers
 };

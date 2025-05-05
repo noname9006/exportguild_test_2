@@ -1168,6 +1168,24 @@ const leftMembersResult = await memberLeft.processLeftMembers(guild, 200, true);
     await monitor.storeGuildMetadata('left_member_processing_error', leftMemberError.message);
   }
   
+  console.log('Cleaning up database entries for users who are no longer on the server...');
+try {
+  const leftUserCleanupResult = await memberLeft.cleanupLeftUsers(guild);
+  
+  if (leftUserCleanupResult.success) {
+    console.log(`Successfully cleaned up database entries for ${leftUserCleanupResult.usersProcessed} users who left the server, removed ${leftUserCleanupResult.rolesRemoved} role entries`);
+    await monitor.storeGuildMetadata('left_users_cleaned', leftUserCleanupResult.usersProcessed.toString());
+    await monitor.storeGuildMetadata('left_users_roles_removed', leftUserCleanupResult.rolesRemoved.toString());
+    await monitor.storeGuildMetadata('left_users_cleanup_time', new Date().toISOString());
+  } else {
+    console.error('Error during left user cleanup:', leftUserCleanupResult.error);
+    await monitor.storeGuildMetadata('left_user_cleanup_error', leftUserCleanupResult.error);
+  }
+} catch (leftUserCleanupError) {
+  console.error('Error during left user cleanup:', leftUserCleanupError);
+  await monitor.storeGuildMetadata('left_user_cleanup_error', leftUserCleanupError.message);
+}
+  
 } catch (memberError) {
   console.error('Error during member data export:', memberError);
   await monitor.storeGuildMetadata('member_export_error', memberError.message);
