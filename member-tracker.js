@@ -1208,17 +1208,26 @@ function initializeMemberTracking(client) {
   });
   
   // Listen for guildMemberUpdate events to track role changes
-  client.on('guildMemberUpdate', async (oldMember, newMember) => {
-    try {
-      // Only process if database is initialized for this guild
-      const dbExists = monitor.checkDatabaseExists(newMember.guild);
-      if (!dbExists) {
-        return;
-      }
-      
-      // Check for role changes
-      const oldRoles = oldMember.roles.cache;
-      const newRoles = newMember.roles.cache;
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  // Log every time the event fires, regardless of database status
+  console.log(`[${getFormattedDateTime()}] MEMBER_UPDATE_EVENT received for ${newMember.user.username}`);
+  
+  try {
+    // Only process if database is initialized for this guild
+    const dbExists = monitor.checkDatabaseExists(newMember.guild);
+    if (!dbExists) {
+      console.log(`[${getFormattedDateTime()}] Database not initialized for guild ${newMember.guild.name} - skipping role tracking`);
+      return;
+    }
+    
+    // Check for role changes
+    const oldRoles = oldMember.roles.cache;
+    const newRoles = newMember.roles.cache;
+    
+    // Log role collections for debugging
+    console.log(`[${getFormattedDateTime()}] Old roles: ${Array.from(oldRoles.values()).map(r => r.name).join(', ')}`);
+    console.log(`[${getFormattedDateTime()}] New roles: ${Array.from(newRoles.values()).map(r => r.name).join(', ')}`);
+    
       
       // Find added roles (in new but not in old)
       for (const [roleId, role] of newRoles) {
@@ -1258,6 +1267,12 @@ function initializeMemberTracking(client) {
       console.error(`[${getFormattedDateTime()}] Error processing member update:`, error);
     }
   });
+  
+  client.on('debug', info => {
+  if (info.includes('GUILD_MEMBER_UPDATE')) {
+    console.log('Debug - Member Update Event:', info);
+  }
+});
   
     // Listen for roleCreate events
   client.on('roleCreate', async (role) => {
