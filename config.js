@@ -53,6 +53,10 @@ const config = {
   // How often to check the WAL for aged entries (in milliseconds)
   walCheckInterval: 610000,
   
+  autoVacuumEnabled: true,
+  vacuumCronSchedule: '15 2 * * *',
+  
+  
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {
     // If environment variable exists, use it, otherwise use config value
