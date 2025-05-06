@@ -7,6 +7,7 @@ const config = require('./config');
 const monitor = require('./monitor');
 const memberTracker = require('./member-tracker');
 const memberLeft = require('./member-left');
+const rolePresent = require('./role-present');
 
 // Parse excluded channels from environment variable or config
 const excludedChannelsArray = config.getConfig('excludedChannels', 'EX_CHANNELS');
@@ -1147,6 +1148,22 @@ try {
   await monitor.storeGuildMetadata('member_roles_exported', roleCount);
   
   await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
+}
+  
+  // Add present role entries to role_history
+console.log('Processing present role entries...');
+try {
+  const rolePresentResult = await rolePresent.processRolesFromMemberRolesTable(guild);
+  if (rolePresentResult.success) {
+    console.log(`Successfully added ${rolePresentResult.addedEntries} present role entries to role_history`);
+     await monitor.storeGuildMetadata('role_present_entries_added', rolePresentResult.addedEntries.toString());
+    await monitor.storeGuildMetadata('role_present_entries_skipped', rolePresentResult.skippedEntries.toString());
+  } else {
+    console.error('Error during present role processing:', rolePresentResult.error);
+  }
+} catch (rolePresentError) {
+  console.error('Error during present role processing:', rolePresentError);
+  await monitor.storeGuildMetadata('role_present_error', rolePresentError.message);
 }
   
   // Process left members after regular member processing
