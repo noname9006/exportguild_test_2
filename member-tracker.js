@@ -14,24 +14,25 @@ async function initializeMemberDatabase(db) {
     console.log('Initializing member tracking database tables...');
     
     // Create members table to store basic member information
-    db.run(`
-      CREATE TABLE IF NOT EXISTS guild_members (
-        id TEXT PRIMARY KEY,
-        username TEXT,
-        avatarURL TEXT,
-        joinedAt TEXT,
-        joinedTimestamp INTEGER,
-        bot INTEGER DEFAULT 0,
-        lastUpdated INTEGER,
-        leftGuild INTEGER DEFAULT 0,
-        leftTimestamp INTEGER
-      )
-    `, (err) => {
-      if (err) {
-        console.error('Error creating guild_members table:', err);
-        reject(err);
-        return;
-      }
+db.run(`
+  CREATE TABLE IF NOT EXISTS guild_members (
+    id TEXT PRIMARY KEY,
+    username TEXT,
+    avatarURL TEXT,
+    joinedAt TEXT,
+    joinedTimestamp INTEGER,
+    bot INTEGER DEFAULT 0,
+    lastUpdated INTEGER,
+    leftGuild INTEGER DEFAULT 0,
+    leftTimestamp INTEGER,
+    rejoinTimestamp INTEGER
+  )
+`, (err) => {
+  if (err) {
+    console.error('Error creating guild_members table:', err);
+    reject(err);
+    return;
+  }
       
       // Create member_roles table to track current roles
       db.run(`
@@ -226,16 +227,46 @@ async function storeMemberRolesInDb(member) {
       // Identify roles to add (in new but not in existing set)
       const rolesToAdd = filteredRoles.filter(role => !existingRoleIds.has(role.id));
       
-      // Begin transaction
-      db.run('BEGIN TRANSACTION', transErr => {
-        if (transErr) {
-          console.error(`Error beginning transaction for member ${member.id}:`, transErr);
-          reject(transErr);
-          return;
+      // Check if we need to make any changes
+      if (rolesToRemove.length === 0 && rolesToAdd.length === 0) {
+        console.log(`No role changes needed for member ${member.user.username}`);
+        resolve(0);
+        return;
+      }
+
+      // First check if we're already in a transaction
+      db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_master'", function(checkErr, row) {
+        if (checkErr) {
+          // Error checking transaction status, proceed with caution
+          console.error(`Error checking transaction status: ${checkErr}. Will try without transaction.`);
+          processRoleChanges(false);
+        } else {
+          // If we can query sqlite_master, we're not in a transaction
+          // Otherwise, the error above would occur
+          processRoleChanges(true);
         }
-        
+      });
+      
+      // Process role changes with or without a transaction
+      function processRoleChanges(useTransaction) {
         let successCount = 0;
         let promiseChain = Promise.resolve();
+        
+        // Start transaction if needed
+        if (useTransaction) {
+          promiseChain = promiseChain.then(() => {
+            return new Promise((resolveBegin, rejectBegin) => {
+              db.run('BEGIN TRANSACTION', function(beginErr) {
+                if (beginErr) {
+                  console.error(`Error beginning transaction for member ${member.id}:`, beginErr);
+                  rejectBegin(beginErr);
+                  return;
+                }
+                resolveBegin();
+              });
+            });
+          });
+        }
         
         // Remove roles that are no longer assigned
         if (rolesToRemove.length > 0) {
@@ -296,9 +327,9 @@ async function storeMemberRolesInDb(member) {
           });
         }
         
-        // Commit transaction after all operations
-        promiseChain
-          .then(() => {
+        // Commit transaction if we started one
+        if (useTransaction) {
+          promiseChain = promiseChain.then(() => {
             return new Promise((resolveCommit, rejectCommit) => {
               db.run('COMMIT', commitErr => {
                 if (commitErr) {
@@ -311,15 +342,27 @@ async function storeMemberRolesInDb(member) {
                 resolveCommit();
               });
             });
-          })
+          });
+        } else {
+          // No transaction, just add a log message
+          promiseChain = promiseChain.then(() => {
+            console.log(`Successfully updated roles for ${member.user.username}: added ${rolesToAdd.length}, removed ${rolesToRemove.length}`);
+            return Promise.resolve();
+          });
+        }
+        
+        // Final resolution
+        promiseChain
           .then(() => {
             resolve(successCount);
           })
           .catch(finalErr => {
-            db.run('ROLLBACK');
+            if (useTransaction) {
+              db.run('ROLLBACK');
+            }
             reject(finalErr);
           });
-      });
+      }
     });
   });
 }
@@ -518,6 +561,7 @@ async function markMemberLeftGuild(memberId, username) {
     
     const currentTime = Date.now();
     
+    // Modified SQL to keep rejoinTimestamp intact
     const sql = `
       UPDATE guild_members 
       SET leftGuild = 1, leftTimestamp = ? 
@@ -526,15 +570,15 @@ async function markMemberLeftGuild(memberId, username) {
     
     db.run(sql, [currentTime, memberId], function(err) {
       if (err) {
-        console.error(`Error marking member ${memberId} as left:`, err);
+        console.error(`[${getFormattedDateTime()}] Error marking member ${memberId} as left:`, err);
         reject(err);
         return;
       }
       
       if (this.changes > 0) {
-        console.log(`Marked member ${username} (${memberId}) as having left the guild`);
+        console.log(`[${getFormattedDateTime()}] Marked member ${username} (${memberId}) as having left the guild`);
       } else {
-        console.log(`Member ${memberId} not found in database or already marked as left`);
+        console.log(`[${getFormattedDateTime()}] Member ${memberId} not found in database or already marked as left`);
       }
       resolve(this.changes);
     });
@@ -1324,47 +1368,116 @@ function initializeMemberTracking(client) {
   console.log(`[${getFormattedDateTime()}] Member tracking initialized`);
   
   // Listen for guildMemberAdd events
-  client.on('guildMemberAdd', async (member) => {
-    try {
-      // Only process if database is initialized for this guild
-      const dbExists = monitor.checkDatabaseExists(member.guild);
-      if (!dbExists) {
-        console.log(`[${getFormattedDateTime()}] Skipping new member ${member.user.username}: no database for guild ${member.guild.name}`);
+client.on('guildMemberAdd', async (member) => {
+  try {
+    // Only process if database is initialized for this guild
+    const dbExists = monitor.checkDatabaseExists(member.guild);
+    if (!dbExists) {
+      console.log(`[${getFormattedDateTime()}] Skipping new member ${member.user.username}: no database for guild ${member.guild.name}`);
+      return;
+    }
+    
+    console.log(`[${getFormattedDateTime()}] New member detected: ${member.user.username} (${member.id})`);
+    
+    // Get the database
+    const db = monitor.getDatabase();
+    
+    // First, check if this member was previously in the database and had left
+    db.get(
+      "SELECT leftGuild, joinedTimestamp FROM guild_members WHERE id = ?", 
+      [member.id], 
+      async (err, row) => {
+        if (err) {
+          console.error(`[${getFormattedDateTime()}] Error checking if member previously left:`, err);
+          // Continue with normal member creation
+          await storeMemberInDb(member);
+          await storeMemberRolesInDb(member);
+          return;
+        }
+        
+        const currentTime = Date.now();
+        
+        if (row && row.leftGuild === 1) {
+          // This member previously left the guild (we have a record with leftGuild=1)
+          console.log(`[${getFormattedDateTime()}] Member ${member.user.username} (${member.id}) is rejoining the guild`);
+          
+          // Update only the necessary fields:
+          // - Set leftGuild back to 0 (they're no longer "left")
+          // - Set rejoinTimestamp to current time
+          // - Update username, avatar URL and lastUpdated (these may have changed)
+          // - Preserve joinedTimestamp and leftTimestamp
+          db.run(`
+            UPDATE guild_members 
+            SET leftGuild = 0,
+                rejoinTimestamp = ?,
+                username = ?,
+                avatarURL = ?,
+                lastUpdated = ?
+            WHERE id = ?
+          `, [
+            currentTime, // Current time for rejoinTimestamp
+            member.user.username,
+            member.user.displayAvatarURL(),
+            currentTime, // lastUpdated
+            member.id
+          ], function(updateErr) {
+            if (updateErr) {
+              console.error(`[${getFormattedDateTime()}] Error updating rejoin timestamp:`, updateErr);
+            } else {
+              console.log(`[${getFormattedDateTime()}] Updated rejoin data for ${member.user.username}`);
+            }
+          });
+        } else {
+          // Either a brand new member or one that didn't have leftGuild=1
+          // Use the standard function to store them
+          await storeMemberInDb(member);
+        }
+        
+        // Always store the member's current roles
+        await storeMemberRolesInDb(member);
+      }
+    );
+  } catch (error) {
+    console.error(`[${getFormattedDateTime()}] Error processing new member:`, error);
+  }
+});
+
+client.on('guildMemberRemove', async (member) => {
+  try {
+    // Only process if database is initialized for this guild
+    const dbExists = monitor.checkDatabaseExists(member.guild);
+    if (!dbExists) {
+      console.log(`[${getFormattedDateTime()}] Skipping member leave ${member.user.username}: no database for guild ${member.guild.name}`);
+      return;
+    }
+    
+    console.log(`[${getFormattedDateTime()}] Member left: ${member.user.username} (${member.id})`);
+    
+    // Mark member as having left the guild - only update leftGuild and leftTimestamp
+    const db = monitor.getDatabase();
+    const currentTime = Date.now();
+    
+    db.run(`
+      UPDATE guild_members 
+      SET leftGuild = 1, leftTimestamp = ? 
+      WHERE id = ?
+    `, [currentTime, member.id], function(err) {
+      if (err) {
+        console.error(`[${getFormattedDateTime()}] Error marking member as left:`, err);
         return;
       }
       
-      console.log(`[${getFormattedDateTime()}] New member detected: ${member.user.username} (${member.id})`);
-      
-      // Store the member in database
-      await storeMemberInDb(member);
-      
-      // Store any initial roles
-      await storeMemberRolesInDb(member);
-      
-    } catch (error) {
-      console.error(`[${getFormattedDateTime()}] Error processing new member:`, error);
-    }
-  });
-  
-  // Listen for guildMemberRemove events
-  client.on('guildMemberRemove', async (member) => {
-    try {
-      // Only process if database is initialized for this guild
-      const dbExists = monitor.checkDatabaseExists(member.guild);
-      if (!dbExists) {
-        console.log(`[${getFormattedDateTime()}] Skipping member leave ${member.user.username}: no database for guild ${member.guild.name}`);
-        return;
+      if (this.changes > 0) {
+        console.log(`[${getFormattedDateTime()}] Marked member ${member.user.username} (${member.id}) as having left the guild`);
+      } else {
+        console.log(`[${getFormattedDateTime()}] Member ${member.id} not found in database or already marked as left`);
       }
-      
-      console.log(`[${getFormattedDateTime()}] Member left: ${member.user.username} (${member.id})`);
-      
-      // Mark member as having left the guild
-      await markMemberLeftGuild(member.id, member.user.username);
-      
-    } catch (error) {
-      console.error(`[${getFormattedDateTime()}] Error processing member leave:`, error);
-    }
-  });
+    });
+    
+  } catch (error) {
+    console.error(`[${getFormattedDateTime()}] Error processing member leave:`, error);
+  }
+});
   
   // Listen for guildMemberUpdate events to track role changes
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
