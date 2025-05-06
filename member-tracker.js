@@ -1447,35 +1447,120 @@ client.on('guildMemberRemove', async (member) => {
     // Only process if database is initialized for this guild
     const dbExists = monitor.checkDatabaseExists(member.guild);
     if (!dbExists) {
-      console.log(`[${getFormattedDateTime()}] Skipping member leave ${member.user.username}: no database for guild ${member.guild.name}`);
+      console.log(`[2025-05-06 16:47:52] Skipping member leave ${member.user.username}: no database for guild ${member.guild.name}`);
       return;
     }
     
-    console.log(`[${getFormattedDateTime()}] Member left: ${member.user.username} (${member.id})`);
+    console.log(`[2025-05-06 16:47:52] Member left: ${member.user.username} (${member.id})`);
     
-    // Mark member as having left the guild - only update leftGuild and leftTimestamp
+    // Get the database
     const db = monitor.getDatabase();
-    const currentTime = Date.now();
     
-    db.run(`
-      UPDATE guild_members 
-      SET leftGuild = 1, leftTimestamp = ? 
-      WHERE id = ?
-    `, [currentTime, member.id], function(err) {
-      if (err) {
-        console.error(`[${getFormattedDateTime()}] Error marking member as left:`, err);
-        return;
-      }
-      
-      if (this.changes > 0) {
-        console.log(`[${getFormattedDateTime()}] Marked member ${member.user.username} (${member.id}) as having left the guild`);
-      } else {
-        console.log(`[${getFormattedDateTime()}] Member ${member.id} not found in database or already marked as left`);
-      }
+    // Begin a transaction to ensure all operations are atomic
+    await new Promise((resolveBegin, rejectBegin) => {
+      db.run('BEGIN TRANSACTION', function(beginErr) {
+        if (beginErr) {
+          console.error(`[2025-05-06 16:47:52] Error beginning transaction for member leave ${member.id}:`, beginErr);
+          rejectBegin(beginErr);
+          return;
+        }
+        resolveBegin();
+      });
     });
     
+    try {
+      // First, fetch all the member's current roles to add to role history
+      const memberRoles = await new Promise((resolveQuery, rejectQuery) => {
+        db.all(`SELECT roleId, roleName FROM member_roles WHERE memberId = ?`, [member.id], (err, rows) => {
+          if (err) {
+            console.error(`[2025-05-06 16:47:52] Error fetching roles for member ${member.id}:`, err);
+            rejectQuery(err);
+            return;
+          }
+          resolveQuery(rows || []);
+        });
+      });
+      
+      const currentTime = Date.now();
+      
+      // Add entries to role_history for each role being removed
+      for (const role of memberRoles) {
+        await new Promise((resolveHistory, rejectHistory) => {
+          db.run(`
+            INSERT INTO role_history (
+              memberId, roleId, action, timestamp
+            ) VALUES (?, ?, ?, ?)
+          `, [
+            member.id,
+            role.roleId,
+            'removed', // Action is 'removed' because member left
+            currentTime
+          ], function(historyErr) {
+            if (historyErr) {
+              console.error(`[2025-05-06 16:47:52] Error adding role history for ${member.id}, role ${role.roleName}:`, historyErr);
+              rejectHistory(historyErr);
+              return;
+            }
+            console.log(`[2025-05-06 16:47:52] Added role history entry: removed role ${role.roleName} for member ${member.id} (left guild)`);
+            resolveHistory();
+          });
+        });
+      }
+      
+      // Now delete the member's roles from member_roles table
+      await new Promise((resolveDelete, rejectDelete) => {
+        db.run(`DELETE FROM member_roles WHERE memberId = ?`, [member.id], function(deleteErr) {
+          if (deleteErr) {
+            console.error(`[2025-05-06 16:47:52] Error removing roles for member ${member.id}:`, deleteErr);
+            rejectDelete(deleteErr);
+            return;
+          }
+          console.log(`[2025-05-06 16:47:52] Removed ${this.changes} roles for member ${member.user.username} (${member.id})`);
+          resolveDelete(this.changes);
+        });
+      });
+      
+      // Then mark member as having left the guild
+      await new Promise((resolveUpdate, rejectUpdate) => {
+        db.run(`
+          UPDATE guild_members 
+          SET leftGuild = 1, leftTimestamp = ? 
+          WHERE id = ?
+        `, [currentTime, member.id], function(err) {
+          if (err) {
+            console.error(`[2025-05-06 16:47:52] Error marking member as left:`, err);
+            rejectUpdate(err);
+            return;
+          }
+          
+          if (this.changes > 0) {
+            console.log(`[2025-05-06 16:47:52] Marked member ${member.user.username} (${member.id}) as having left the guild`);
+          } else {
+            console.log(`[2025-05-06 16:47:52] Member ${member.id} not found in database or already marked as left`);
+          }
+          resolveUpdate(this.changes);
+        });
+      });
+      
+      // Commit the transaction
+      await new Promise((resolveCommit, rejectCommit) => {
+        db.run('COMMIT', commitErr => {
+          if (commitErr) {
+            console.error(`[2025-05-06 16:47:52] Error committing transaction for member leave ${member.id}:`, commitErr);
+            rejectCommit(commitErr);
+            return;
+          }
+          resolveCommit();
+        });
+      });
+    } catch (transactionError) {
+      // Rollback on error
+      db.run('ROLLBACK');
+      console.error(`[2025-05-06 16:47:52] Error processing member leave, transaction rolled back:`, transactionError);
+    }
+    
   } catch (error) {
-    console.error(`[${getFormattedDateTime()}] Error processing member leave:`, error);
+    console.error(`[2025-05-06 16:47:52] Error processing member leave:`, error);
   }
 });
   

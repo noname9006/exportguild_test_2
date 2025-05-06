@@ -19,7 +19,8 @@ const config = {
     '1142961066163327089',
     '1151246155141890098',
     '937915189435703329',
-    '1142972007080808468'
+    '1142972007080808468',
+    '1217802017464913931'
   ],
   
   // Export threshold - how many messages to process before auto-save
@@ -46,26 +47,11 @@ const config = {
   // Monitor batch insert size - how many messages to insert at once during monitoring
   monitorBatchSize: 5,
   
-  // Status update interval in milliseconds 
+  // Status update interval in milliseconds
   statusUpdateInterval: 20000,
   
   // How often to check the WAL for aged entries (in milliseconds)
   walCheckInterval: 610000,
-  
-   // Cron schedule for automatic vacuum operations (default: every day at 2 AM)
-  vacuumCronSchedule: "0 2 * * *",
-  
-  // Whether automatic vacuum is enabled
-  autoVacuumEnabled: true,
-  
-    // Channel where monitoring notifications will be sent (set to empty string to disable)
-  channelMonitorLogChannel: "", 
-  
-  // Whether automatic channel monitoring is enabled
-  channelMonitoringEnabled: true,
-  
-  // Number of members to process in each batch
-memberBatchSize: 100,
   
   // Helper function to get environment variables or use defaults from this config
   getConfig: function(key, envName) {
