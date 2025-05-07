@@ -8,6 +8,7 @@ const monitor = require('./monitor');
 const memberTracker = require('./member-tracker');
 const memberLeft = require('./member-left');
 const rolePresent = require('./role-present');
+const { importRoleAuditLogs } = require('./import-audit');
 
 // Parse excluded channels from environment variable or config
 const excludedChannelsArray = config.getConfig('excludedChannels', 'EX_CHANNELS');
@@ -1138,25 +1139,29 @@ try {
   const memberResult = await memberTracker.fetchAndStoreMembersForGuild(guild, memberStatusMessage);
   
   if (memberResult.success) {
-  console.log(`Successfully stored member data: ${memberResult.memberCount} members with ${memberResult.roleCount || 0} roles`);
-  
-  // Store metadata about member export
-  await monitor.storeGuildMetadata('members_exported', memberResult.memberCount ? memberResult.memberCount.toString() : '0');
-  
-  // Fix for roleCount being undefined
-  const roleCount = memberResult.roleCount !== undefined ? memberResult.roleCount.toString() : '0';
-  await monitor.storeGuildMetadata('member_roles_exported', roleCount);
-  
-  await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
+    console.log(`Successfully stored member data: ${memberResult.memberCount} members with ${memberResult.roleCount || 0} roles`);
+    
+    // Store metadata about member export
+    await monitor.storeGuildMetadata('members_exported', memberResult.memberCount ? memberResult.memberCount.toString() : '0');
+    
+    // Fix for roleCount being undefined
+    const roleCount = memberResult.roleCount !== undefined ? memberResult.roleCount.toString() : '0';
+    await monitor.storeGuildMetadata('member_roles_exported', roleCount);
+    
+    await monitor.storeGuildMetadata('member_export_completed_at', new Date().toISOString());
+  }
+} catch (memberExportError) {
+  console.error('Error during member data export:', memberExportError);
+  await monitor.storeGuildMetadata('member_export_error', memberExportError.message);
 }
   
-  // Add present role entries to role_history
+// Add present role entries to role_history
 console.log('Processing present role entries...');
 try {
   const rolePresentResult = await rolePresent.processRolesFromMemberRolesTable(guild);
   if (rolePresentResult.success) {
     console.log(`Successfully added ${rolePresentResult.addedEntries} present role entries to role_history`);
-     await monitor.storeGuildMetadata('role_present_entries_added', rolePresentResult.addedEntries.toString());
+    await monitor.storeGuildMetadata('role_present_entries_added', rolePresentResult.addedEntries.toString());
     await monitor.storeGuildMetadata('role_present_entries_skipped', rolePresentResult.skippedEntries.toString());
   } else {
     console.error('Error during present role processing:', rolePresentResult.error);
@@ -1166,26 +1171,26 @@ try {
   await monitor.storeGuildMetadata('role_present_error', rolePresentError.message);
 }
   
-  // Process left members after regular member processing
-  console.log('Processing members who have left the guild...');
-  try {
-	  
-const leftMembersResult = await memberLeft.processLeftMembers(guild, 200, true);
-
-    if (leftMembersResult.success) {
-      console.log(`Successfully processed left members: ${leftMembersResult.addedCount} former members added to database`);
-      await monitor.storeGuildMetadata('left_members_processed', leftMembersResult.addedCount.toString());
-      await monitor.storeGuildMetadata('left_members_processed_at', new Date().toISOString());
-    } else {
-      console.error('Error during left member processing:', leftMembersResult.error);
-      await monitor.storeGuildMetadata('left_member_processing_error', leftMembersResult.error);
-    }
-  } catch (leftMemberError) {
-    console.error('Error during left member processing:', leftMemberError);
-    await monitor.storeGuildMetadata('left_member_processing_error', leftMemberError.message);
-  }
+// Process left members after regular member processing
+console.log('Processing members who have left the guild...');
+try {
+  const leftMembersResult = await memberLeft.processLeftMembers(guild, 200, true);
   
-  console.log('Cleaning up database entries for users who are no longer on the server...');
+  if (leftMembersResult.success) {
+    console.log(`Successfully processed left members: ${leftMembersResult.addedCount} former members added to database`);
+    await monitor.storeGuildMetadata('left_members_processed', leftMembersResult.addedCount.toString());
+    await monitor.storeGuildMetadata('left_members_processed_at', new Date().toISOString());
+  } else {
+    console.error('Error during left member processing:', leftMembersResult.error);
+    await monitor.storeGuildMetadata('left_member_processing_error', leftMembersResult.error);
+  }
+} catch (memberError) {
+  console.error('Error during member data export:', memberError);
+  await monitor.storeGuildMetadata('member_export_error', memberError.message);
+}
+
+// Cleanup database entries for users no longer on server
+console.log('Cleaning up database entries for users who are no longer on the server...');
 try {
   const leftUserCleanupResult = await memberLeft.cleanupLeftUsers(guild);
   
@@ -1202,12 +1207,36 @@ try {
   console.error('Error during left user cleanup:', leftUserCleanupError);
   await monitor.storeGuildMetadata('left_user_cleanup_error', leftUserCleanupError.message);
 }
-  
-} catch (memberError) {
-  console.error('Error during member data export:', memberError);
-  await monitor.storeGuildMetadata('member_export_error', memberError.message);
-}
     
+// Import role audit logs
+console.log('Starting role audit log import...');
+try {
+  const auditStatusMessage = await message.channel.send(
+    `Role Audit Log Import Status\n` +
+    `🔄 Initializing role audit log import...`
+  );
+  
+  const auditStats = await importRoleAuditLogs(guild, { batchSize: 100 });
+  
+  // Update status message with results
+  await auditStatusMessage.edit(
+    `✅ Role Audit Log Import Complete\n` +
+    `- Fetched: ${auditStats.fetched} audit logs\n` +
+    `- Inserted: ${auditStats.inserted} new entries\n` +
+    `- Skipped: ${auditStats.skipped} existing entries\n` +
+    `- Errors: ${auditStats.errors} entries`
+  );
+  
+  // Store metadata about audit log import
+  await monitor.storeGuildMetadata('role_audit_logs_fetched', auditStats.fetched.toString());
+  await monitor.storeGuildMetadata('role_audit_logs_inserted', auditStats.inserted.toString());
+  await monitor.storeGuildMetadata('role_audit_logs_skipped', auditStats.skipped.toString());
+  await monitor.storeGuildMetadata('role_audit_logs_completed_at', new Date().toISOString());
+} catch (auditError) {
+  console.error('Error during role audit log import:', auditError);
+  await monitor.storeGuildMetadata('role_audit_log_error', auditError.message);
+}
+	
     // IMPORTANT: Ensure monitoring is active after export completes
     console.log(`Export completed. Ensuring monitoring is active for guild ${guild.name}`);
     
@@ -1332,6 +1361,37 @@ async function fetchChannelMetadata(client, guildId) {
         console.error(`Error processing channel ${channel.id}:`, channelError);
       }
     }
+	
+console.log('Starting role audit log import...');
+try {
+  const auditStatusMessage = await message.channel.send(
+    `Role Audit Log Import Status\n` +
+    `🔄 Initializing role audit log import...`
+  );
+  
+  console.log('Before calling importRoleAuditLogs function');
+  const auditStats = await importRoleAuditLogs(guild, { batchSize: 100 });
+  console.log('After importRoleAuditLogs function returned:', auditStats);
+  
+  // Update status message with results
+  await auditStatusMessage.edit(
+    `✅ Role Audit Log Import Complete\n` +
+    `- Fetched: ${auditStats.fetched} audit logs\n` +
+    `- Inserted: ${auditStats.inserted} new entries\n` +
+    `- Skipped: ${auditStats.skipped} existing entries\n` +
+    `- Errors: ${auditStats.errors} entries`
+  );
+  
+  // Store metadata about audit log import
+  await monitor.storeGuildMetadata('role_audit_logs_fetched', auditStats.fetched.toString());
+  await monitor.storeGuildMetadata('role_audit_logs_inserted', auditStats.inserted.toString());
+  await monitor.storeGuildMetadata('role_audit_logs_skipped', auditStats.skipped.toString());
+  await monitor.storeGuildMetadata('role_audit_logs_completed_at', new Date().toISOString());
+} catch (auditError) {
+  console.error('Error during role audit log import:', auditError);
+  console.error('Error details:', auditError.stack);
+  await monitor.storeGuildMetadata('role_audit_log_error', auditError.message);
+}
     
     console.log(`Processed ${processedCount}/${channels.length} channels`);
     return true;
@@ -1346,10 +1406,4 @@ module.exports = {
   handleExportGuild,
   extractMessageMetadata, // Still needed for other modules
   fetchChannelMetadata    // Add the new function to exports
-};
-
-// Export functions
-module.exports = {
-  handleExportGuild,
-  extractMessageMetadata // Still needed for other modules
 };
